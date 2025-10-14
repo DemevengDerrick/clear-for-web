@@ -8,6 +8,10 @@ import streamlit as st
 import matplotlib.pyplot as plt
 from scipy.interpolate import griddata  # replaces deprecated matplotlib.mlab.griddata
 
+import pandas as pd
+import pydeck as pdk
+from pyproj import Transformer
+
 # ------------------------
 # Shared parsing utilities
 # ------------------------
@@ -285,6 +289,79 @@ def make_plots(x: np.ndarray, y: np.ndarray, Z: np.ndarray, label_list: List[str
     fig.tight_layout()
     return fig
 
+def _looks_like_lonlat(x: np.ndarray, y: np.ndarray) -> bool:
+    # crude but effective check
+    return (
+        np.all(np.isfinite(x)) and np.all(np.isfinite(y)) and
+        np.min(x) >= -180 and np.max(x) <= 180 and
+        np.min(y) >= -90  and np.max(y) <= 90
+    )
+
+def _to_wgs84(x: np.ndarray, y: np.ndarray, src_epsg: str) -> Tuple[np.ndarray, np.ndarray]:
+    """Project (x,y) from src_epsg to EPSG:4326 (lon, lat)."""
+    if src_epsg in ("EPSG:4326", "4326"):
+        return x, y
+    tr = Transformer.from_crs(src_epsg, "EPSG:4326", always_xy=True)
+    lon, lat = tr.transform(x, y)
+    return np.array(lon), np.array(lat)
+
+def _basemap_layer(style: str) -> pdk.Layer:
+    """Return a TileLayer for the chosen basemap."""
+    if style == "OpenStreetMap":
+        return pdk.Layer(
+            "TileLayer",
+            data="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+            min_zoom=0, max_zoom=19, tile_size=256, opacity=1.0
+        )
+    elif style == "Satellite (Esri WorldImagery)":
+        return pdk.Layer(
+            "TileLayer",
+            data="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+            min_zoom=0, max_zoom=19, tile_size=256, opacity=1.0
+        )
+    else:  # fallback to OSM
+        return pdk.Layer(
+            "TileLayer",
+            data="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+            min_zoom=0, max_zoom=19, tile_size=256, opacity=1.0
+        )
+
+def _render_map(lon: np.ndarray, lat: np.ndarray, Z: np.ndarray, labels: List[str], annotate: bool, basemap_style: str = "OpenStreetMap"):
+    df = pd.DataFrame({
+        "lon": lon, "lat": lat, "z": Z, "label": labels if annotate else [""] * len(labels)
+    })
+
+    # Basemap goes first so point layer draws on top
+    base = _basemap_layer(basemap_style)
+
+    points = pdk.Layer(
+        "ScatterplotLayer",
+        df,
+        get_position=["lon", "lat"],
+        get_radius=4,
+        get_fill_color=[0, 128, 255],
+        pickable=True,
+        radius_min_pixels=2,
+        radius_max_pixels=10,
+    )
+
+    view = pdk.ViewState(
+        latitude=float(df["lat"].median()),
+        longitude=float(df["lon"].median()),
+        zoom=13,
+        bearing=0, pitch=0,
+    )
+    tooltip = {"html": "<b>{label}</b><br>Z: {z}<br>Lon: {lon}<br>Lat: {lat}"}
+
+    deck = pdk.Deck(
+        layers=[base, points],
+        initial_view_state=view,
+        map_style=None,  # we provide our own basemap tiles
+        tooltip=tooltip,
+    )
+    st.pydeck_chart(deck, use_container_width=True)
+
+
 # ------------------------
 # Streamlit UI
 # ------------------------
@@ -379,6 +456,11 @@ with tabs[1]:
                 fig = make_plots(x, y, Z, labels if annotate else [""] * len(labels), grid_n=grid_n)
                 st.pyplot(fig, clear_figure=True)
 
+                # ✅ store arrays so the map UI (outside) can use them later
+                st.session_state.viz = {
+                    "x": x, "y": y, "Z": Z, "labels": labels, "annotate": annotate
+                }
+
                 # Quick stats
                 st.subheader("Summary")
                 c1, c2, c3 = st.columns(3)
@@ -388,6 +470,74 @@ with tabs[1]:
 
             except Exception as e:
                 st.error(f"Visualization failed: {e}")
+    
+    # --- Mapping controls (outside submitted_viz; always visible after first run) ---
+    st.markdown("### 🗺️ Interactive Map")
+    if "viz" not in st.session_state:
+        st.info("Upload data and click **Generate Plots** first to enable the map.")
+    else:
+        x = st.session_state.viz["x"]
+        y = st.session_state.viz["y"]
+        Z = st.session_state.viz["Z"]
+        labels = st.session_state.viz["labels"]
+        annotate = st.session_state.viz["annotate"]
+
+        show_map = st.checkbox(
+            "Show interactive map",
+            value=False,
+            help="Plots points on a basemap (reprojects to WGS84)."
+        )
+
+        if show_map:
+            auto_is_lonlat = _looks_like_lonlat(x, y)
+            col1, col2 = st.columns([1.2, 1])
+            with col1:
+                crs_choice = st.selectbox(
+                    "Coordinate Reference System (CRS)",
+                    [
+                        "Auto-detect (use EPSG:4326 if it looks like lon/lat)",
+                        "EPSG:4326 (lon/lat)",
+                        "EPSG:32632 (UTM 32N)",
+                        "EPSG:32633 (UTM 33N)",
+                        "Custom EPSG code…",
+                    ],
+                    index=0 if auto_is_lonlat else 2
+                )
+            with col2:
+                custom_epsg = ""
+                if crs_choice == "Custom EPSG code…":
+                    custom_epsg = st.text_input("Enter EPSG code (e.g., 32736)", value="")
+
+            try:
+                if crs_choice == "Auto-detect (use EPSG:4326 if it looks like lon/lat)":
+                    src_epsg = "EPSG:4326" if auto_is_lonlat else "EPSG:32632"
+                elif crs_choice == "EPSG:4326 (lon/lat)":
+                    src_epsg = "EPSG:4326"
+                elif crs_choice == "EPSG:32632 (UTM 32N)":
+                    src_epsg = "EPSG:32632"
+                elif crs_choice == "EPSG:32633 (UTM 33N)":
+                    src_epsg = "EPSG:32633"
+                else:
+                    src_epsg = f"EPSG:{custom_epsg.strip()}" if custom_epsg.strip() else "EPSG:4326"
+
+                # Basemap choice
+                basemap_style = st.selectbox(
+                    "Basemap",
+                    ["OpenStreetMap", "Satellite (Esri WorldImagery)"],
+                    index=0,
+                    help="OpenStreetMap is vector-like streets; Satellite uses Esri WorldImagery."
+                )
+
+                # Reproject and render
+                lon, lat = _to_wgs84(x, y, src_epsg)
+                if np.any(~np.isfinite(lon)) or np.any(~np.isfinite(lat)):
+                    raise ValueError("Non-finite coordinates after reprojection.")
+                _render_map(lon, lat, Z, labels, annotate, basemap_style=basemap_style)
+
+                
+            except Exception as map_err:
+                st.warning(f"Couldn’t render map with CRS='{src_epsg}'. Tip: confirm your EPSG code. Details: {map_err}")
+
 
 # -------------- Tab 3: Download Clear Desktop --------------
 with tabs[2]:
