@@ -34,17 +34,19 @@ def _should_discard(line: str) -> bool:
 
 def _transform_columns(tokens: List[str], station_mode: int) -> str:
     """
-    Reproduce your per-line transformation:
-      - If two tokens: drop first, join + "," (mode-independent in your code)
-      - Else: del [7:11], del [2], del [0], join (mode1 no delimiter, mode2 comma),
-              wrap with leading & trailing newline
-    Guards against short rows.
+    Transform one raw line into a single, comma-separated record (no leading/trailing blanks),
+    and remove stray commas/semicolons that were causing empty fields.
     """
+    # clean each token once up front
+    tokens = [t.strip().strip(",;") for t in tokens if t.strip().strip(",;") != ""]
+
     if len(tokens) == 2:
-        del tokens[0]
-        return "".join(tokens) + ","
+        # Example: ['1,"S1",', '1.635000;,'] → keep the second, cleaned (no semicolon)
+        return tokens[1]
+
     if len(tokens) < 11:
         return ""  # malformed / too short
+
     t = tokens[:]
     try:
         del t[7:11]
@@ -52,30 +54,67 @@ def _transform_columns(tokens: List[str], station_mode: int) -> str:
         del t[0]
     except IndexError:
         return ""
-    joined = "".join(t) if station_mode == 1 else ",".join(t)
-    return f"\n{joined}\n"
+
+    # Always comma-join; we already removed empties/stray punctuation
+    joined = ",".join(t).strip()
+    return joined
+
+
+def _is_number_like(s: str) -> bool:
+    try:
+        float(s.strip().strip(",;"))
+        return True
+    except Exception:
+        return False
 
 def _prefix_codes(lines: Iterable[str], cs: str, cr: str, cm: str) -> Iterable[str]:
     """
-    Prefix each non-empty line with Station/Reference/Measure codes using your n/m rule:
-      - if len(line) < 25 → station code; set m = n+1
-      - elif n == m → reference code
-      - else → measure code
+    Same n/m rule, but with look-ahead:
+      - Merge two consecutive 'short' lines into one station record (name + height)
+      - After emitting the station record, set m = n + 1 so the *next* line is code 3
+      - Otherwise, preserve original behavior
     """
+    # normalize input lines once
+    buf = [ (ln or "").strip() for ln in lines if (ln or "").strip() ]
     n = 0
     m = 0
-    for lin in lines:
-        if not lin.strip():
-            continue
+    i = 0
+    L = len(buf)
+
+    while i < L:
+        lin = buf[i]
         n += 1
+
+        # STATION: short line = name (original heuristic)
         if len(lin) < 25:
-            out = f"{cs},{lin}".rstrip("\n") + "\n"
+            out = f"{cs},{lin}".rstrip(",")
+            # look ahead for height line (also short and numeric)
+            merged = False
+            if i + 1 < L:
+                nxt = buf[i + 1].strip()
+                if len(nxt) < 25 and _is_number_like(nxt):
+                    # consume height line
+                    i += 1
+                    n += 1
+                    out = f"{out},{nxt}".rstrip(",")
+                    merged = True
+
+            # emit station (with trailing comma) and set m so next line is code 3
+            yield out + ",\n"
             m = n + 1
-        elif n == m:
-            out = f"{cr},{lin}".rstrip("\n") + "\n"
-        else:
-            out = f"{cm},{lin}".rstrip("\n") + "\n"
-        yield out
+            i += 1
+            continue
+
+        # REFERENCE: when n == m
+        if n == m:
+            yield f"{cr},{lin}".rstrip(",") + ",\n"
+            i += 1
+            continue
+
+        # MEASURE: everything else
+        yield f"{cm},{lin}".rstrip(",") + ",\n"
+        i += 1
+
 
 def clean_idx_text(
     raw_text: str,
@@ -253,7 +292,7 @@ def make_plots(x: np.ndarray, y: np.ndarray, Z: np.ndarray, label_list: List[str
 st.set_page_config(page_title="IDX Cleaner & Viz", page_icon="🧹", layout="wide")
 st.title("🧹 IDX Cleaner & Visualizer")
 
-tabs = st.tabs(["🔧 Clean & Export", "📈 Visualize"])
+tabs = st.tabs(["🔧 Clean & Export", "📈 Visualize", "💾 Download Clear Desktop"])
 
 with st.sidebar:
     st.markdown("### ⚙️ Options")
@@ -279,7 +318,7 @@ with tabs[0]:
         uploaded_clean = st.file_uploader("Upload IDX/TXT file", type=["idx", "txt", "log"], key="u_clean")
         colA, colB, colC, colD = st.columns([1, 1, 1, 1])
         with colA:
-            station_mode = st.radio("Code of Apparatus (Station Mode)", options=[1, 2], index=0, horizontal=True,
+            station_mode = st.radio("Code of Apparatus (Total Station Model)", options=[1, 2], index=0, horizontal=True,
                                     help="For TCR300/400/700/800, TS → 1; Builders/TS06plus → 2")
         with colB:
             code_station = st.text_input("Code of Station", value=default_codes["station"])
@@ -349,3 +388,14 @@ with tabs[1]:
 
             except Exception as e:
                 st.error(f"Visualization failed: {e}")
+
+# -------------- Tab 3: Download Clear Desktop --------------
+with tabs[2]:
+    st.subheader("Download Clear (Desktop)")
+    st.caption("Click the button to download the Clear desktop installer.")
+
+    # Your shared link converted to a direct-download URL
+    direct_url = "https://drive.google.com/uc?export=download&id=1JukA4QQy2akC-GKhMemc2RvRpk2rdspK"
+
+    st.link_button("⬇️ Download Clear Desktop", direct_url, use_container_width=True)
+
