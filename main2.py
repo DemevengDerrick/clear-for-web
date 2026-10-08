@@ -1,4 +1,3 @@
-# app.py
 import datetime
 import io
 import json
@@ -24,9 +23,7 @@ DISCARDED_PREFIXES = (
     "SETUP",
     "STN_NO",
     "END",
-    "SLOPE(TgtNo, TgtID, CfgNo, Hz, Vz, SDist, RefHt, Date, Ppm, ApplType, Flags)",
-    "SLOPE (TgtNo, TgtID, CfgNo, Hz, Vz, SDist, RefHt, Date, Ppm, ApplType, Flags)",
-    "SLOPE",
+    "SLOPE",  # also covers the SLOPE(...) column header
 )
 
 # Total station model → IDX layout (1: comma-separated, 2: tab-separated)
