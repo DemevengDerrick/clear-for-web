@@ -1,6 +1,7 @@
 import datetime
 import io
 import json
+import re
 import urllib.parse
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Tuple
@@ -708,7 +709,7 @@ if st.session_state.get("file_key") != file_key:
     st.session_state.pop("clean", None)
     st.session_state.pop("viz", None)
 
-tabs = st.tabs(["🔧 Clean & Export", "📈 Visualize", "💾 Download Clear Desktop"])
+tabs = st.tabs(["🔧 Clean & Export", "📈 Visualize", "💾 Download Clear Desktop", "❓ Help"])
 
 # -------------- Tab 1: Cleaning --------------
 with tabs[0]:
@@ -933,6 +934,33 @@ with tabs[2]:
     direct_url = "https://drive.google.com/uc?export=download&id=1JukA4QQy2akC-GKhMemc2RvRpk2rdspK"
 
     st.link_button("⬇️ Download Clear Desktop", direct_url, width="stretch")
+
+# -------------- Tab 4: Help --------------
+with tabs[3]:
+    # The user guide lives in README.md between the help markers, so the app and the
+    # repository documentation stay in sync. Image lines are rendered with st.image.
+    app_dir = Path(__file__).parent
+    try:
+        readme = (app_dir / "README.md").read_text(encoding="utf-8")
+        guide = readme.split("<!-- help:start -->", 1)[1].split("<!-- help:end -->", 1)[0]
+    except (OSError, IndexError):
+        guide = ""
+
+    if not guide.strip():
+        st.info("The user guide is not available. See README.md in the project repository.")
+    else:
+        chunk: List[str] = []
+        for line in guide.splitlines():
+            img = re.fullmatch(r"!\[(.*)\]\((.+)\)", line.strip())
+            if not img:
+                chunk.append(line)
+                continue
+            st.markdown("\n".join(chunk))
+            chunk = []
+            img_path = app_dir / img.group(2)
+            if img_path.exists():
+                st.image(str(img_path), caption=img.group(1))
+        st.markdown("\n".join(chunk))
 
 # -------------- Footer --------------
 st.divider()
