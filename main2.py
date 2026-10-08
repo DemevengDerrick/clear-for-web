@@ -941,6 +941,7 @@ with tabs[2]:
 st.divider()
 st.markdown(
     f"<div style='text-align:center; color:gray; font-size:0.85em;'>"
-    f"© {datetime.date.today().year} Derrick Demeveng. All rights reserved.</div>",
+    f"© {datetime.date.today().year} Tangent Analytics. All rights reserved. · "
+    f"<a href='mailto:tangent.anlytics.ca@gmail.com' style='color:gray;'>tangent.anlytics.ca@gmail.com</a></div>",
     unsafe_allow_html=True,
 )
