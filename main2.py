@@ -1,6 +1,8 @@
 # app.py
 import datetime
 import io
+import json
+import urllib.parse
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Tuple
 
@@ -241,6 +243,286 @@ def parse_points_for_plot(raw_text: str) -> Tuple[np.ndarray, np.ndarray, np.nda
     return np.array(xs), np.array(ys), np.array(zs), labels, skipped
 
 
+# ------------------------
+# Survey network utilities
+# ------------------------
+
+def _angle_full_circle(raw_text: str) -> float:
+    """Full-circle value of the file's ANGULAR unit (GRADS → 400, DEGREES → 360)."""
+    for line in raw_text.splitlines():
+        s = line.strip().upper()
+        if s.startswith("ANGULAR"):
+            if "DEG" in s:
+                return 360.0
+            if "MIL" in s:
+                return 6400.0
+            return 400.0
+    return 400.0
+
+
+def _to_float(s: str):
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _point_coordinates(raw_text: str) -> Tuple[Dict[str, Tuple[float, float]], Dict[str, Tuple[float, float]]]:
+    """
+    Read East/North for every POINTS row that has them.
+    Returns (by PointNo, by PointID). For a PointID measured several times,
+    a FIX row wins over MEAS rows; otherwise the last valid row is kept.
+    """
+    by_no, by_id, id_is_fix = {}, {}, {}
+    in_points = False
+    for line in raw_text.splitlines():
+        s = line.strip()
+        if not in_points:
+            if s.startswith("POINTS"):
+                in_points = True
+            continue
+        if s.startswith("END"):
+            break
+        f = _split_fields(line)
+        if len(f) < 4:
+            continue
+        x, y = _to_float(f[2]), _to_float(f[3])
+        if x is None or y is None:
+            continue
+        no, pid = f[0], f[1].strip('"').strip()
+        is_fix = f[-1].upper() == "FIX"
+        by_no[no] = (x, y)
+        if is_fix or not id_is_fix.get(pid, False):
+            by_id[pid] = (x, y)
+            id_is_fix[pid] = id_is_fix.get(pid, False) or is_fix
+    return by_no, by_id
+
+
+def parse_network(raw_text: str) -> Dict:
+    """
+    Build the station/reference network from the SETUP and SLOPE sections.
+      - nodes: {point_id: {"x", "y", "role": "station" | "reference"}}
+      - edges: one per measured direction (from_id → to_id) between network
+        points, with mean horizontal distance, Hz reading and the horizontal
+        angle measured from the setup's reference direction
+      - details: (from_id, to_id) sights to non-network points
+    """
+    full_circle = _angle_full_circle(raw_text)
+    by_no, by_id = _point_coordinates(raw_text)
+
+    def coords(no: str, pid: str):
+        return by_no.get(no) or by_id.get(pid)
+
+    # 1) Collect setups and their sights
+    setups = []
+    cur = None
+    in_slope = False
+    for line in raw_text.splitlines():
+        s = line.strip()
+        if s.startswith("SETUP"):
+            cur = {"no": "", "id": "", "sights": []}
+            setups.append(cur)
+            in_slope = False
+        elif cur is not None and s.startswith("STN_NO"):
+            cur["no"] = _split_fields(line)[-1]
+        elif cur is not None and s.startswith("STN_ID"):
+            cur["id"] = _split_fields(line)[-1].strip('"').strip()
+        elif s.startswith("SLOPE"):
+            in_slope = cur is not None
+        elif s.startswith("END SLOPE"):
+            in_slope = False
+        elif in_slope:
+            f = _split_fields(line)
+            if len(f) >= SLOPE_FIELD_COUNT:
+                cur["sights"].append({
+                    "no": f[0], "id": f[1].strip('"').strip(),
+                    "hz": _to_float(f[3]), "vz": _to_float(f[4]), "sd": _to_float(f[5]),
+                })
+
+    setups = [su for su in setups if su["id"]]
+    station_ids = {su["id"] for su in setups}
+    reference_ids = {su["sights"][0]["id"] for su in setups if su["sights"]}
+    network_ids = station_ids | reference_ids
+
+    # 2) Nodes with coordinates
+    nodes = {}
+    for su in setups:
+        xy = coords(su["no"], su["id"])
+        if xy:
+            nodes[su["id"]] = {"x": xy[0], "y": xy[1], "role": "station"}
+    for su in setups:
+        for sg in su["sights"]:
+            if sg["id"] in network_ids and sg["id"] not in nodes:
+                xy = coords(sg["no"], sg["id"])
+                if xy:
+                    nodes[sg["id"]] = {"x": xy[0], "y": xy[1], "role": "reference"}
+
+    # 3) Edges between network points, merging repeated sights of one direction
+    edges: Dict[Tuple[str, str], Dict] = {}
+    details = set()
+    missing = set()
+    for su in setups:
+        if not su["sights"]:
+            continue
+        ref_hz = su["sights"][0]["hz"]
+        for k, sg in enumerate(su["sights"]):
+            a, b = su["id"], sg["id"]
+            if a == b:
+                continue
+            if b not in network_ids:
+                if a in nodes:
+                    xy = coords(sg["no"], b)
+                    if xy:
+                        details.add((a, b, xy))
+                continue
+            if a not in nodes or b not in nodes:
+                missing.add((a, b))
+                continue
+            e = edges.setdefault((a, b), {"from": a, "to": b, "hd": [], "hz": sg["hz"],
+                                          "angle": None, "is_reference": False})
+            if k == 0:
+                e["is_reference"] = True
+            elif not e["is_reference"] and e["angle"] is None and sg["hz"] is not None and ref_hz is not None:
+                e["angle"] = (sg["hz"] - ref_hz) % full_circle
+            if sg["sd"] and sg["vz"] is not None:
+                e["hd"].append(sg["sd"] * np.sin(sg["vz"] * 2 * np.pi / full_circle))
+
+    for e in edges.values():
+        e["hd"] = float(np.mean(e["hd"])) if e["hd"] else None
+
+    return {
+        "nodes": nodes,
+        "edges": list(edges.values()),
+        "details": sorted(details),
+        "missing": sorted(missing),
+        "angle_unit": {400.0: "gon", 360.0: "°", 6400.0: "mil"}[full_circle],
+    }
+
+
+def make_network_figure(net: Dict, show_distances: bool = True, show_angles: bool = False,
+                        show_details: bool = False):
+    """
+    Interactive (zoom/pan) plot of the network: stations, references and arrows
+    for each measured direction. When A→B and B→A were both measured, each
+    arrow is shifted to its own right-hand side so the pair doesn't overlap.
+    """
+    import plotly.graph_objects as go
+
+    nodes, edges = net["nodes"], net["edges"]
+    if not nodes:
+        raise ValueError("No stations with coordinates were found in this file.")
+    xs = [n["x"] for n in nodes.values()]
+    ys = [n["y"] for n in nodes.values()]
+    lengths = [np.hypot(nodes[e["to"]]["x"] - nodes[e["from"]]["x"], nodes[e["to"]]["y"] - nodes[e["from"]]["y"])
+               for e in edges]
+    lengths = [v for v in lengths if v > 0]
+    typical = float(np.median(lengths)) if lengths else max(max(xs) - min(xs), max(ys) - min(ys), 1.0)
+    gap = typical * 0.04          # spacing between forward and backward arrows
+    label_px = 10                 # distance of the label from its arrow, in pixels
+    pairs = {(e["from"], e["to"]) for e in edges}
+
+    fig = go.Figure()
+
+    # Sights to detail points (thin, no arrowheads, to keep the plot readable)
+    if show_details and net["details"]:
+        dx, dy = [], []
+        for a, _, (bx, by) in net["details"]:
+            dx += [nodes[a]["x"], bx, None]
+            dy += [nodes[a]["y"], by, None]
+        fig.add_trace(go.Scatter(x=dx, y=dy, mode="lines", line=dict(color="lightgray", width=1),
+                                 name="Detail sights", hoverinfo="skip"))
+        bx = [p[2][0] for p in net["details"]]
+        by = [p[2][1] for p in net["details"]]
+        fig.add_trace(go.Scatter(x=bx, y=by, mode="markers", marker=dict(size=4, color="gray"),
+                                 name="Detail points", text=[p[1] for p in net["details"]],
+                                 hovertemplate="%{text}<extra></extra>"))
+
+    annotations = []
+    hover_x, hover_y, hover_text = [], [], []
+    for e in edges:
+        a, b = nodes[e["from"]], nodes[e["to"]]
+        x0, y0, x1, y1 = a["x"], a["y"], b["x"], b["y"]
+        vx, vy = x1 - x0, y1 - y0
+        length = float(np.hypot(vx, vy))
+        if length == 0:
+            continue
+        ux, uy = vx / length, vy / length
+        rx, ry = uy, -ux  # right-hand normal
+        if (e["to"], e["from"]) in pairs:
+            x0, y0, x1, y1 = x0 + rx * gap, y0 + ry * gap, x1 + rx * gap, y1 + ry * gap
+
+        color = "#d62728" if e["is_reference"] else "#1f77b4"
+        annotations.append(dict(
+            x=x1, y=y1, ax=x0, ay=y0, xref="x", yref="y", axref="x", ayref="y",
+            showarrow=True, arrowhead=3, arrowsize=1.2, arrowwidth=1.6, arrowcolor=color,
+            standoff=9, startstandoff=9, text="",
+        ))
+
+        parts = []
+        if show_distances and e["hd"] is not None:
+            parts.append(f"{e['hd']:.2f} m")
+        if show_angles and e["angle"] is not None:
+            parts.append(f"∠ {e['angle']:.4f} {net['angle_unit']}")
+        mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+        if parts:
+            angle = np.degrees(np.arctan2(vy, vx))
+            if angle > 90:
+                angle -= 180
+            elif angle < -90:
+                angle += 180
+            # offset in screen pixels so the label stays clear of its arrow at any zoom
+            annotations.append(dict(
+                x=mx, y=my, xref="x", yref="y", xshift=rx * label_px, yshift=ry * label_px,
+                text=" · ".join(parts), showarrow=False, textangle=-angle,
+                font=dict(size=10, color=color),
+            ))
+
+        hd = f"{e['hd']:.3f} m" if e["hd"] is not None else "—"
+        ang = f"{e['angle']:.4f} {net['angle_unit']}" if e["angle"] is not None else "—"
+        hz = f"{e['hz']:.4f} {net['angle_unit']}" if e["hz"] is not None else "—"
+        hover_x.append(mx)
+        hover_y.append(my)
+        hover_text.append(
+            f"<b>{e['from']} → {e['to']}</b>"
+            f"{' (reference)' if e['is_reference'] else ''}"
+            f"<br>Horizontal distance: {hd}<br>Hz reading: {hz}<br>Angle from reference: {ang}"
+        )
+
+    # Invisible midpoints carry the hover details for each arrow
+    fig.add_trace(go.Scatter(x=hover_x, y=hover_y, mode="markers", marker=dict(size=10, opacity=0),
+                             text=hover_text, hovertemplate="%{text}<extra></extra>", showlegend=False))
+
+    for role, symbol, color, name in (("station", "triangle-up", "#d62728", "Stations"),
+                                      ("reference", "circle", "#2ca02c", "References")):
+        ids = [k for k, n in nodes.items() if n["role"] == role]
+        if not ids:
+            continue
+        fig.add_trace(go.Scatter(
+            x=[nodes[k]["x"] for k in ids], y=[nodes[k]["y"] for k in ids],
+            mode="markers+text", text=ids, textposition="top center",
+            textfont=dict(size=12, color="black"),
+            marker=dict(symbol=symbol, size=14, color=color, line=dict(width=1, color="white")),
+            name=name,
+            customdata=[[nodes[k]["x"], nodes[k]["y"]] for k in ids],
+            hovertemplate="<b>%{text}</b><br>E %{customdata[0]:.3f}<br>N %{customdata[1]:.3f}<extra></extra>",
+        ))
+
+    # Legend entries for the arrow colours
+    for color, name in (("#d62728", "Sight to reference"), ("#1f77b4", "Sight to network point")):
+        fig.add_trace(go.Scatter(x=[None], y=[None], mode="lines", line=dict(color=color, width=2), name=name))
+
+    fig.update_layout(
+        annotations=annotations, height=650, dragmode="pan",
+        margin=dict(l=10, r=10, t=30, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0),
+        plot_bgcolor="white",
+    )
+    fig.update_xaxes(title="East (m)", showgrid=True, gridcolor="#eee", zeroline=False)
+    fig.update_yaxes(title="North (m)", showgrid=True, gridcolor="#eee", zeroline=False,
+                     scaleanchor="x", scaleratio=1)
+    return fig
+
+
 def _surface_unavailable(ax, title: str):
     ax.set_title(title)
     ax.text(0.5, 0.5, "Needs at least 3\nnon-collinear points",
@@ -334,34 +616,43 @@ def _to_wgs84(x: np.ndarray, y: np.ndarray, src_epsg: str) -> Tuple[np.ndarray, 
     lon, lat = tr.transform(x, y)
     return np.array(lon), np.array(lat)
 
-def _basemap_layer(style: str) -> pdk.Layer:
-    """Return a TileLayer for the chosen basemap."""
-    if style == "OpenStreetMap":
-        return pdk.Layer(
-            "TileLayer",
-            data="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-            min_zoom=0, max_zoom=19, tile_size=256, opacity=1.0
-        )
-    elif style == "Satellite (Esri WorldImagery)":
-        return pdk.Layer(
-            "TileLayer",
-            data="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-            min_zoom=0, max_zoom=19, tile_size=256, opacity=1.0
-        )
-    else:  # fallback to OSM
-        return pdk.Layer(
-            "TileLayer",
-            data="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-            min_zoom=0, max_zoom=19, tile_size=256, opacity=1.0
-        )
+BASEMAPS = {
+    "OpenStreetMap": (
+        "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        "© OpenStreetMap contributors",
+    ),
+    "Satellite (Esri WorldImagery)": (
+        "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        "Tiles © Esri — Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community",
+    ),
+}
+
+def _basemap_style(style: str) -> str:
+    """
+    Return the chosen basemap as a raster map style (data: URL) for map_style.
+    A pydeck TileLayer can't be used here: without a JS renderSubLayers it hands
+    image tiles to a GeoJsonLayer and draws nothing.
+    """
+    tiles, attribution = BASEMAPS.get(style, BASEMAPS["OpenStreetMap"])
+    style_json = {
+        "version": 8,
+        "sources": {
+            "basemap": {
+                "type": "raster",
+                "tiles": [tiles],
+                "tileSize": 256,
+                "maxzoom": 19,
+                "attribution": attribution,
+            }
+        },
+        "layers": [{"id": "basemap", "type": "raster", "source": "basemap"}],
+    }
+    return "data:application/json," + urllib.parse.quote(json.dumps(style_json))
 
 def _render_map(lon: np.ndarray, lat: np.ndarray, Z: np.ndarray, labels: List[str], annotate: bool, basemap_style: str = "OpenStreetMap"):
     df = pd.DataFrame({
         "lon": lon, "lat": lat, "z": Z, "label": labels if annotate else [""] * len(labels)
     })
-
-    # Basemap goes first so point layer draws on top
-    base = _basemap_layer(basemap_style)
 
     points = pdk.Layer(
         "ScatterplotLayer",
@@ -383,9 +674,9 @@ def _render_map(lon: np.ndarray, lat: np.ndarray, Z: np.ndarray, labels: List[st
     tooltip = {"html": "<b>{label}</b><br>Z: {z}<br>Lon: {lon}<br>Lat: {lat}"}
 
     deck = pdk.Deck(
-        layers=[base, points],
+        layers=[points],
         initial_view_state=view,
-        map_style=None,  # we provide our own basemap tiles
+        map_style=_basemap_style(basemap_style),
         tooltip=tooltip,
     )
     st.pydeck_chart(deck)
@@ -498,102 +789,142 @@ with tabs[0]:
 with tabs[1]:
     with st.form("viz_form", clear_on_submit=False):
         annotate = st.checkbox("Annotate points with labels", value=True)
-        submitted_viz = st.form_submit_button("Generate Plots", type="primary")
+        submitted_viz = st.form_submit_button("Generate Visuals", type="primary")
 
     if submitted_viz:
         if not uploaded:
             st.warning("Please upload a file first.")
         else:
+            # Network and point plots are built independently so one can work without the other
+            viz = {"annotate": annotate}
+            try:
+                viz["network"] = parse_network(raw_text)
+            except Exception as e:
+                viz["network_error"] = str(e)
             try:
                 x, y, Z, labels, skipped = parse_points_for_plot(raw_text)
                 fig = make_plots(x, y, Z, labels if annotate else [""] * len(labels), grid_n=grid_n)
                 png = io.BytesIO()
                 fig.savefig(png, format="png", dpi=120)
                 plt.close(fig)
-
-                # store results so the plots, summary and map survive reruns
-                st.session_state.viz = {
-                    "x": x, "y": y, "Z": Z, "labels": labels, "annotate": annotate,
-                    "skipped": skipped, "png": png.getvalue(),
-                }
+                viz["points"] = {"x": x, "y": y, "Z": Z, "labels": labels,
+                                 "skipped": skipped, "png": png.getvalue()}
             except Exception as e:
-                st.session_state.pop("viz", None)
-                st.error(f"Visualization failed: {e}")
+                viz["points_error"] = str(e)
+            # store results so the visuals survive reruns
+            st.session_state.viz = viz
 
     viz = st.session_state.get("viz")
-    if viz:
-        x, y, Z = viz["x"], viz["y"], viz["Z"]
-        labels, annotate = viz["labels"], viz["annotate"]
-
-        st.image(viz["png"], width="stretch")
-        st.download_button(
-            "⬇️ Download plots (PNG)",
-            data=viz["png"],
-            file_name=f"{file_stem}_plots.png",
-            mime="image/png",
-        )
-
-        # Quick stats
-        st.subheader("Summary")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Points", f"{len(x)}")
-        c2.metric("Z min / max", f"{np.min(Z):.3f} / {np.max(Z):.3f}")
-        c3.metric("X span / Y span", f"{(np.max(x)-np.min(x)):.2f} / {(np.max(y)-np.min(y)):.2f}")
-        if viz["skipped"]:
-            st.caption(f"{viz['skipped']} point(s) skipped because East, North or Elevation was missing.")
-
-    # --- Mapping controls (always visible after first run) ---
-    st.markdown("### 🗺️ Interactive Map")
     if not viz:
-        st.info("Upload data and click **Generate Plots** first to enable the map.")
+        st.info("Upload a file and click **Generate Visuals** to see the survey network, map and terrain plots.")
     else:
-        show_map = st.checkbox(
-            "Show interactive map",
-            value=False,
-            help="Plots points on a basemap (reprojects to WGS84)."
-        )
+        pts = viz.get("points")
 
-        if show_map:
-            auto_is_lonlat = _looks_like_lonlat(x, y)
-            auto_label = "Auto-detect (→ " + ("WGS84 lon/lat" if auto_is_lonlat else "UTM 32N") + ")"
-            crs_options = {
-                auto_label: "EPSG:4326" if auto_is_lonlat else "EPSG:32632",
-                "EPSG:4326 (lon/lat)": "EPSG:4326",
-                "EPSG:32632 (UTM 32N)": "EPSG:32632",
-                "EPSG:32633 (UTM 33N)": "EPSG:32633",
-                "Custom EPSG code…": None,
-            }
-            col1, col2 = st.columns([1.2, 1])
-            with col1:
-                crs_choice = st.selectbox("Coordinate Reference System (CRS)", list(crs_options), index=0)
-            with col2:
-                custom_epsg = ""
-                if crs_choice == "Custom EPSG code…":
-                    custom_epsg = st.text_input("Enter EPSG code (e.g., 32736)", value="")
+        # --- 1) Survey network ---
+        st.markdown("### 🕸️ Survey Network")
+        net = viz.get("network")
+        if not net or not net["nodes"]:
+            st.info(viz.get("network_error") or
+                    "No station setups with coordinates were found in this file, so there is no network to draw.")
+        else:
+            c1, c2, c3 = st.columns(3)
+            show_dist = c1.checkbox("Show distances", value=True)
+            show_ang = c2.checkbox("Show angles from reference", value=False,
+                                   help="Horizontal angle at the station, measured clockwise from the reference sight.")
+            show_det = c3.checkbox("Show detail sights", value=False,
+                                   help="Also draw sights to detail (non-network) points.")
+            net_fig = make_network_figure(net, show_distances=show_dist, show_angles=show_ang,
+                                          show_details=show_det)
+            st.plotly_chart(net_fig, config={"scrollZoom": True, "displaylogo": False})
+            n_st = sum(1 for n in net["nodes"].values() if n["role"] == "station")
+            n_ref = len(net["nodes"]) - n_st
+            st.caption(
+                f"{n_st} stations, {n_ref} references, {len(net['edges'])} measured directions. "
+                "Red arrows are sights to the setup's reference, blue arrows sights to other network points; "
+                "forward and backward sights are drawn side by side. Distances are horizontal "
+                "(slope distance × sin Vz). Scroll to zoom, drag to pan, double-click to reset; "
+                "hover an arrow for its details."
+            )
+            if net["missing"]:
+                st.caption("Not drawn (no coordinates in the POINTS table): "
+                           + ", ".join(f"{a} → {b}" for a, b in net["missing"]))
 
-            basemap_style = st.selectbox(
-                "Basemap",
-                ["OpenStreetMap", "Satellite (Esri WorldImagery)"],
-                index=0,
-                help="OpenStreetMap is vector-like streets; Satellite uses Esri WorldImagery."
+        # --- 2) Interactive map ---
+        st.markdown("### 🗺️ Interactive Map")
+        if not pts:
+            st.info(f"The map needs point coordinates. {viz.get('points_error', '')}")
+        else:
+            x, y, Z, labels = pts["x"], pts["y"], pts["Z"], pts["labels"]
+            show_map = st.checkbox(
+                "Show interactive map",
+                value=False,
+                help="Plots points on a basemap (reprojects to WGS84)."
             )
 
-            src_epsg = crs_options[crs_choice]
-            if src_epsg is None:
-                code = custom_epsg.strip().upper().removeprefix("EPSG:").strip()
-                src_epsg = f"EPSG:{code}" if code else None
+            if show_map:
+                auto_is_lonlat = _looks_like_lonlat(x, y)
+                auto_label = "Auto-detect (→ " + ("WGS84 lon/lat" if auto_is_lonlat else "UTM 32N") + ")"
+                crs_options = {
+                    auto_label: "EPSG:4326" if auto_is_lonlat else "EPSG:32632",
+                    "EPSG:4326 (lon/lat)": "EPSG:4326",
+                    "EPSG:32632 (UTM 32N)": "EPSG:32632",
+                    "EPSG:32633 (UTM 33N)": "EPSG:32633",
+                    "Custom EPSG code…": None,
+                }
+                col1, col2 = st.columns([1.2, 1])
+                with col1:
+                    crs_choice = st.selectbox("Coordinate Reference System (CRS)", list(crs_options), index=0)
+                with col2:
+                    custom_epsg = ""
+                    if crs_choice == "Custom EPSG code…":
+                        custom_epsg = st.text_input("Enter EPSG code (e.g., 32736)", value="")
 
-            if src_epsg is None:
-                st.info("Enter an EPSG code to display the map.")
-            else:
-                try:
-                    # Reproject and render
-                    lon, lat = _to_wgs84(x, y, src_epsg)
-                    if np.any(~np.isfinite(lon)) or np.any(~np.isfinite(lat)):
-                        raise ValueError("Non-finite coordinates after reprojection.")
-                    _render_map(lon, lat, Z, labels, annotate, basemap_style=basemap_style)
-                except Exception as map_err:
-                    st.warning(f"Couldn’t render map with CRS='{src_epsg}'. Tip: confirm your EPSG code. Details: {map_err}")
+                basemap_style = st.selectbox(
+                    "Basemap",
+                    ["OpenStreetMap", "Satellite (Esri WorldImagery)"],
+                    index=0,
+                    help="OpenStreetMap is vector-like streets; Satellite uses Esri WorldImagery."
+                )
+
+                src_epsg = crs_options[crs_choice]
+                if src_epsg is None:
+                    code = custom_epsg.strip().upper().removeprefix("EPSG:").strip()
+                    src_epsg = f"EPSG:{code}" if code else None
+
+                if src_epsg is None:
+                    st.info("Enter an EPSG code to display the map.")
+                else:
+                    try:
+                        # Reproject and render
+                        lon, lat = _to_wgs84(x, y, src_epsg)
+                        if np.any(~np.isfinite(lon)) or np.any(~np.isfinite(lat)):
+                            raise ValueError("Non-finite coordinates after reprojection.")
+                        _render_map(lon, lat, Z, labels, viz["annotate"], basemap_style=basemap_style)
+                    except Exception as map_err:
+                        st.warning(f"Couldn’t render map with CRS='{src_epsg}'. Tip: confirm your EPSG code. Details: {map_err}")
+
+        # --- 3) Static terrain plots ---
+        st.markdown("### 📈 Terrain Plots (MNT)")
+        if not pts:
+            st.warning(f"Terrain plots unavailable: {viz.get('points_error', '')}")
+        else:
+            x, y, Z = pts["x"], pts["y"], pts["Z"]
+            st.image(pts["png"], width="stretch")
+            st.download_button(
+                "⬇️ Download plots (PNG)",
+                data=pts["png"],
+                file_name=f"{file_stem}_plots.png",
+                mime="image/png",
+            )
+
+            # Quick stats
+            st.subheader("Summary")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Points", f"{len(x)}")
+            c2.metric("Z min / max", f"{np.min(Z):.3f} / {np.max(Z):.3f}")
+            c3.metric("X span / Y span", f"{(np.max(x)-np.min(x)):.2f} / {(np.max(y)-np.min(y)):.2f}")
+            if pts["skipped"]:
+                st.caption(f"{pts['skipped']} point(s) skipped because East, North or Elevation was missing.")
 
 
 # -------------- Tab 3: Download Clear Desktop --------------
@@ -610,6 +941,7 @@ with tabs[2]:
 st.divider()
 st.markdown(
     f"<div style='text-align:center; color:gray; font-size:0.85em;'>"
-    f"© {datetime.date.today().year} Derrick Demeveng. All rights reserved.</div>",
+    f"© {datetime.date.today().year} Tangent Analytics. All rights reserved. · "
+    f"<a href='mailto:tangent.anlytics.ca@gmail.com' style='color:gray;'>tangent.anlytics.ca@gmail.com</a></div>",
     unsafe_allow_html=True,
 )

@@ -5,3 +5,4 @@ pydeck
 matplotlib==3.8.4
 scipy==1.13.1
 pyproj
+plotly
